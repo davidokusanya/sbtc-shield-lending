@@ -17,6 +17,7 @@
 ;; Data Variables
 (define-data-var protocol-paused bool false)
 (define-data-var governance-address principal 'SP000000000000000000002Q6VF78)
+(define-data-var contract-owner principal tx-sender) ;; Store contract deployer as owner
 (define-data-var liquidation-threshold uint u150) ;; 150% = minimum collateral ratio required to avoid liquidation
 (define-data-var collateralization-ratio uint u200) ;; 200% = required collateral ratio for new loans (higher than liquidation threshold)
 (define-data-var liquidation-penalty uint u10) ;; 10% penalty on liquidated positions
@@ -26,8 +27,29 @@
 (define-data-var btc-price-in-cents uint u0) ;; Current BTC price in cents
 (define-data-var price-last-updated uint u0) ;; Timestamp when price was last updated
 
-;; SIP-010 Trait for Fungible Tokens
-(use-trait ft-trait 'SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE.sip-010-trait-ft-standard.sip-010-trait)
+;; Define SIP-010 Trait for Fungible Tokens locally
+(define-trait ft-trait
+  (
+    ;; Transfer from the caller to a new principal
+    (transfer (uint principal principal (optional (buff 34))) (response bool uint))
+    ;; Get the token balance of a principal
+    (get-balance (principal) (response uint uint))
+    ;; Get the total supply of the token
+    (get-total-supply () (response uint uint))
+    ;; Get the token name
+    (get-name () (response (string-ascii 32) uint))
+    ;; Get the token symbol
+    (get-symbol () (response (string-ascii 32) uint))
+    ;; Get the number of decimals used by the token
+    (get-decimals () (response uint uint))
+    ;; Get the URI containing token metadata
+    (get-token-uri () (response (optional (string-utf8 256)) uint))
+    ;; Mint new tokens
+    (mint (uint principal) (response bool uint))
+    ;; Burn tokens
+    (burn (uint principal) (response bool uint))
+  )
+)
 
 ;; Oracle trait definition
 (define-trait oracle-trait
@@ -58,6 +80,11 @@
 
 (define-read-only (get-price-last-updated)
   (var-get price-last-updated)
+)
+
+;; Get contract owner
+(define-read-only (get-contract-owner)
+  (var-get contract-owner)
 )
 
 ;; Check if price is stale
@@ -104,7 +131,7 @@
 
 ;; Access control modifier for governance functions
 (define-private (is-governance-or-owner)
-  (or (is-eq tx-sender (var-get governance-address)) (is-eq tx-sender contract-owner))
+  (or (is-eq tx-sender (var-get governance-address)) (is-eq tx-sender (var-get contract-owner)))
 )
 
 ;; Protocol governance functions
@@ -112,6 +139,13 @@
   (begin
     (asserts! (is-governance-or-owner) ERR-NOT-AUTHORIZED)
     (ok (var-set governance-address new-address))
+  )
+)
+
+(define-public (set-contract-owner (new-owner principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (ok (var-set contract-owner new-owner))
   )
 )
 
@@ -147,8 +181,8 @@
       (price-response (contract-call? oracle get-price-in-cents))
       (time-response (contract-call? oracle get-last-update-time))
     )
-      (asserts! (is-ok price-response) (unwrap-err price-response))
-      (asserts! (is-ok time-response) (unwrap-err time-response))
+      (asserts! (is-ok price-response) (err u1006))
+      (asserts! (is-ok time-response) (err u1006))
       
       (var-set btc-price-in-cents (unwrap-panic price-response))
       (var-set price-last-updated (unwrap-panic time-response))
@@ -167,12 +201,14 @@
     (asserts! (> amount u0) ERR-ZERO-AMOUNT)
     
     ;; Transfer sBTC from user to contract
-    (try! (contract-call? sbtc-token transfer amount tx-sender (as-contract tx-sender) none))
-    
-    ;; Update user's collateral
-    (map-set user-collateral tx-sender (+ (get-user-collateral tx-sender) amount))
-    
-    (ok amount)
+    (let 
+      ((transfer-result (try! (contract-call? sbtc-token transfer amount tx-sender (as-contract tx-sender) none))))
+      
+      ;; Update user's collateral
+      (map-set user-collateral tx-sender (+ (get-user-collateral tx-sender) amount))
+      
+      (ok amount)
+    )
   )
 )
 
@@ -203,17 +239,18 @@
           ;; Update collateral amount
           (map-set user-collateral tx-sender new-collateral)
           
-          ;; Transfer sBTC from contract to user
-          (as-contract (contract-call? sbtc-token transfer amount (as-contract tx-sender) tx-sender none))
+          ;; Transfer sBTC from contract to user - using try! to handle the response
+          (try! (as-contract (contract-call? sbtc-token transfer amount (as-contract tx-sender) tx-sender none)))
+          (ok amount)
         )
         (begin
           ;; If no loan, simply update and transfer
           (map-set user-collateral tx-sender (- current-collateral amount))
-          (as-contract (contract-call? sbtc-token transfer amount (as-contract tx-sender) tx-sender none))
+          ;; Transfer sBTC from contract to user - using try! to handle the response
+          (try! (as-contract (contract-call? sbtc-token transfer amount (as-contract tx-sender) tx-sender none)))
+          (ok amount)
         )
       )
-      
-      (ok amount)
     )
   )
 )
@@ -352,7 +389,7 @@
 ;; Contract initialization
 (define-public (initialize (new-governance principal))
   (begin
-    (asserts! (is-eq tx-sender contract-owner) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
     (var-set governance-address new-governance)
     (ok true)
   )
