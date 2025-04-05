@@ -63,7 +63,7 @@
 ;; Check if price is stale
 (define-read-only (is-price-stale)
   (let (
-    (current-time (unwrap-panic (get-block-info? time (- block-height u1))))
+    (current-time stacks-block-height)
     (last-updated (var-get price-last-updated))
   )
     (> (- current-time last-updated) (var-get price-stale-threshold))
@@ -229,7 +229,7 @@
       (collateral (get-user-collateral tx-sender))
       (current-loan (get-user-loan tx-sender))
       (price-in-cents (var-get btc-price-in-cents))
-      (current-time (unwrap-panic (get-block-info? time (- block-height u1))))
+      (current-time stacks-block-height)
     )
       ;; Verify collateral exists
       (asserts! (>= collateral (var-get minimum-collateral-amount)) ERR-COLLATERAL-BELOW-MINIMUM)
