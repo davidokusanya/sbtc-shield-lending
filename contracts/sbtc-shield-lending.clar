@@ -185,3 +185,60 @@
     )
   )
 )
+
+;; Function to borrow stablecoin against collateral
+(define-public (borrow (stablecoin <ft-trait>) (amount uint) (oracle <oracle-trait>))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+    (asserts! (> amount u0) ERR-ZERO-AMOUNT)
+    
+    (let (
+      (collateral (get-user-collateral tx-sender))
+      (current-loan (get-user-loan tx-sender))
+      (price-response (contract-call? oracle get-price-in-cents))
+      (last-update-response (contract-call? oracle get-last-update-time))
+    )
+      ;; Verify collateral exists
+      (asserts! (>= collateral (var-get minimum-collateral-amount)) ERR-COLLATERAL-BELOW-MINIMUM)
+      
+      ;; Verify price data is available and fresh
+      (asserts! (is-ok price-response) (unwrap-err price-response))
+      (asserts! (is-ok last-update-response) (unwrap-err last-update-response))
+      
+      (let (
+        (price-in-cents (unwrap-ok price-response))
+        (last-update (unwrap-ok last-update-response))
+        (current-time (get-block-info time (- block-height u1)))
+      )
+        ;; Check price freshness
+        (asserts! (<= (- current-time last-update) (var-get price-stale-threshold)) ERR-PRICE-STALE)
+        
+        ;; Calculate new total loan
+        (let (
+          (new-total-loan (+ current-loan amount))
+          ;; Calculate collateral value in cents: collateral * price-in-cents / 100000000 (sats to BTC conversion)
+          (collateral-value-cents (/ (* collateral price-in-cents) u100000000))
+          ;; Calculate max loan allowed: collateral value / collateralization ratio
+          (max-allowed-loan (/ (* collateral-value-cents u100) (var-get collateralization-ratio)))
+        )
+          ;; Ensure new loan doesn't exceed max allowed
+          (asserts! (<= new-total-loan max-allowed-loan) ERR-MAX-LOAN-EXCEEDED)
+          
+          ;; Update loan amount
+          (map-set user-loan-amount tx-sender new-total-loan)
+          (map-set user-last-interest-calc tx-sender current-time)
+          
+          ;; Calculate protocol fee
+          (let ((fee-amount (/ (* amount (var-get protocol-fee)) u100)))
+            ;; Mint stablecoin to user (minus fee)
+            (try! (as-contract (contract-call? stablecoin mint (- amount fee-amount) tx-sender)))
+            ;; Mint fee to governance address
+            (try! (as-contract (contract-call? stablecoin mint fee-amount (var-get governance-address))))
+            
+            (ok amount)
+          )
+        )
+      )
+    )
+  )
+)
