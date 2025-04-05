@@ -274,3 +274,65 @@
     )
   )
 )
+
+;; Function to liquidate undercollateralized positions
+(define-public (liquidate (user principal) (sbtc-token <ft-trait>) (stablecoin <ft-trait>) (oracle <oracle-trait>))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+    
+    ;; Check if position is liquidatable
+    (asserts! (is-liquidatable user oracle) ERR-LIQUIDATION-FAILED)
+    
+    (let (
+      (loan-amount (get-user-loan user))
+      (collateral-amount (get-user-collateral user))
+      (price-response (unwrap! (contract-call? oracle get-price-in-cents) ERR-PRICE-STALE))
+      (penalty-amount (/ (* loan-amount (var-get liquidation-penalty)) u100))
+      (total-to-repay (+ loan-amount penalty-amount))
+    )
+      ;; Transfer stablecoin from liquidator to contract for repayment
+      (try! (contract-call? stablecoin transfer loan-amount tx-sender (as-contract tx-sender) none))
+      
+      ;; Calculate collateral value and determine how much to give liquidator
+      (let (
+        ;; Calculate price per sat: price-in-cents / 100000000 (cents per BTC / sats per BTC)
+        (price-per-sat (/ price-in-cents u100000000))
+        ;; Calculate how much collateral to give to liquidator (including bonus)
+        (liquidator-collateral (/ (* total-to-repay u100) price-per-sat))
+      )
+        ;; Ensure we don't take more than available
+        (let ((collateral-to-take (if (> liquidator-collateral collateral-amount) 
+                                    collateral-amount 
+                                    liquidator-collateral)))
+          ;; Update loan and collateral status
+          (map-delete user-loan-amount user)
+          (map-delete user-last-interest-calc user)
+          
+          (if (< collateral-to-take collateral-amount)
+            ;; If partial liquidation, update remaining collateral
+            (map-set user-collateral user (- collateral-amount collateral-to-take))
+            ;; Otherwise remove collateral entry entirely
+            (map-delete user-collateral user)
+          )
+          
+          ;; Burn the loan amount
+          (try! (as-contract (contract-call? stablecoin burn loan-amount (as-contract tx-sender))))
+          
+          ;; Transfer liquidated collateral to liquidator
+          (try! (as-contract (contract-call? sbtc-token transfer collateral-to-take (as-contract tx-sender) tx-sender none)))
+          
+          (ok collateral-to-take)
+        )
+      )
+    )
+  )
+)
+
+;; Contract initialization
+(define-public (initialize (new-governance principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) ERR-NOT-AUTHORIZED)
+    (var-set governance-address new-governance)
+    (ok true)
+  )
+)
