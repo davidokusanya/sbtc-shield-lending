@@ -89,3 +89,39 @@
     )
   )
 )
+
+;; Access control modifier for governance functions
+(define-private (is-governance-or-owner)
+  (or (is-eq tx-sender (var-get governance-address)) (is-eq tx-sender contract-owner))
+)
+
+;; Protocol governance functions
+(define-public (set-governance-address (new-address principal))
+  (begin
+    (asserts! (is-governance-or-owner) ERR-NOT-AUTHORIZED)
+    (ok (var-set governance-address new-address))
+  )
+)
+
+(define-public (set-protocol-paused (paused bool))
+  (begin
+    (asserts! (is-governance-or-owner) ERR-NOT-AUTHORIZED)
+    (ok (var-set protocol-paused paused))
+  )
+)
+
+(define-public (set-liquidation-threshold (new-threshold uint))
+  (begin
+    (asserts! (is-governance-or-owner) ERR-NOT-AUTHORIZED)
+    (asserts! (>= new-threshold u110) ERR-LOAN-UNDERCOLLATERALIZED) ;; minimum 110% threshold for safety
+    (ok (var-set liquidation-threshold new-threshold))
+  )
+)
+
+(define-public (set-collateralization-ratio (new-ratio uint))
+  (begin
+    (asserts! (is-governance-or-owner) ERR-NOT-AUTHORIZED)
+    (asserts! (> new-ratio (var-get liquidation-threshold)) ERR-LOAN-UNDERCOLLATERALIZED)
+    (ok (var-set collateralization-ratio new-ratio))
+  )
+)
