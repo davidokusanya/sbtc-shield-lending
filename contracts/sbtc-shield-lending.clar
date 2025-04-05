@@ -23,11 +23,13 @@
 (define-data-var minimum-collateral-amount uint u1000000) ;; Minimum amount in sats (0.01 BTC = 1,000,000 sats)
 (define-data-var protocol-fee uint u1) ;; 1% fee on borrowed amount
 (define-data-var price-stale-threshold uint u3600) ;; Price staleness threshold in seconds (1 hour)
+(define-data-var btc-price-in-cents uint u0) ;; Current BTC price in cents
+(define-data-var price-last-updated uint u0) ;; Timestamp when price was last updated
 
 ;; SIP-010 Trait for Fungible Tokens
 (use-trait ft-trait 'SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE.sip-010-trait-ft-standard.sip-010-trait)
 
-;; Oracle contract interface
+;; Oracle trait definition
 (define-trait oracle-trait
   (
     (get-price-in-cents () (response uint uint))
@@ -49,43 +51,53 @@
   (default-to u0 (map-get? user-loan-amount user))
 )
 
+;; Get current price data
+(define-read-only (get-current-price)
+  (var-get btc-price-in-cents)
+)
+
+(define-read-only (get-price-last-updated)
+  (var-get price-last-updated)
+)
+
+;; Check if price is stale
+(define-read-only (is-price-stale)
+  (let (
+    (current-time (unwrap-panic (get-block-info? time (- block-height u1))))
+    (last-updated (var-get price-last-updated))
+  )
+    (> (- current-time last-updated) (var-get price-stale-threshold))
+  )
+)
+
 ;; Get loan health percentage (collateral value / loan value * 100)
-(define-read-only (get-loan-health (user principal) (oracle <oracle-trait>))
+;; Returns 0 if no loan, or the health percentage (e.g., 200 = 200% collateralized)
+(define-read-only (get-loan-health (user principal))
   (let (
     (collateral (get-user-collateral user))
     (loan (get-user-loan user))
-    (price-response (contract-call? oracle get-price-in-cents))
-    (last-update-response (contract-call? oracle get-last-update-time))
+    (price-in-cents (var-get btc-price-in-cents))
   )
-    (if (is-err price-response)
-      (err (unwrap-err price-response))
-      (if (is-err last-update-response)
-        (err (unwrap-err last-update-response))
-        (let (
-          (price-in-cents (unwrap! price-response ERR-PRICE-STALE))
-          (last-update (unwrap! last-update-response ERR-PRICE-STALE))
-          (current-time (get-block-info time (- block-height u1)))
-        )
-          (if (> (- current-time last-update) (var-get price-stale-threshold))
-            ERR-PRICE-STALE
-            (if (or (is-eq loan u0) (is-eq collateral u0))
-              (ok u0)
-              ;; Calculate loan health: (collateral * price) / (loan * 100) * 100
-              (ok (/ (* (* collateral price-in-cents) u100) loan))
-            )
-          )
-        )
-      )
+    (if (or (is-eq loan u0) (is-eq collateral u0))
+      u0
+      ;; Calculate loan health: (collateral * price) / (loan * 100) * 100
+      ;; Convert sats to BTC by dividing by 100,000,000
+      (/ (* (* collateral price-in-cents) u100) (* loan u100000000))
     )
   )
 )
 
 ;; Check if loan is eligible for liquidation
-(define-read-only (is-liquidatable (user principal) (oracle <oracle-trait>))
-  (let ((health-response (get-loan-health user oracle)))
-    (if (is-err health-response)
-      true
-      (< (unwrap! health-response ERR-LOAN-NOT-FOUND) (var-get liquidation-threshold))
+(define-read-only (is-liquidatable (user principal))
+  (let (
+    (health (get-loan-health user))
+    (threshold (var-get liquidation-threshold))
+  )
+    (and 
+      (> (get-user-loan user) u0)  ;; Has a loan
+      (> (get-user-collateral user) u0)  ;; Has collateral
+      (< health threshold)  ;; Below threshold
+      (not (is-price-stale))  ;; Only if price is fresh
     )
   )
 )
@@ -126,6 +138,26 @@
   )
 )
 
+;; Update price from oracle (only governance or contract owner)
+(define-public (update-price (oracle <oracle-trait>))
+  (begin
+    (asserts! (is-governance-or-owner) ERR-NOT-AUTHORIZED)
+    
+    (let (
+      (price-response (contract-call? oracle get-price-in-cents))
+      (time-response (contract-call? oracle get-last-update-time))
+    )
+      (asserts! (is-ok price-response) (unwrap-err price-response))
+      (asserts! (is-ok time-response) (unwrap-err time-response))
+      
+      (var-set btc-price-in-cents (unwrap-panic price-response))
+      (var-set price-last-updated (unwrap-panic time-response))
+      
+      (ok (var-get btc-price-in-cents))
+    )
+  )
+)
+
 ;; Core lending protocol functions
 
 ;; Function to deposit sBTC as collateral
@@ -145,10 +177,11 @@
 )
 
 ;; Function to withdraw collateral (if no outstanding loans or sufficient collateral remaining)
-(define-public (withdraw-collateral (sbtc-token <ft-trait>) (amount uint) (oracle <oracle-trait>))
+(define-public (withdraw-collateral (sbtc-token <ft-trait>) (amount uint))
   (begin
     (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
     (asserts! (> amount u0) ERR-ZERO-AMOUNT)
+    (asserts! (not (is-price-stale)) ERR-PRICE-STALE)
     
     (let (
       (current-collateral (get-user-collateral tx-sender))
@@ -161,12 +194,11 @@
       (if (> current-loan u0)
         (let (
           (new-collateral (- current-collateral amount))
-          (health-response (get-loan-health tx-sender oracle))
+          (new-health (/ (* (* new-collateral (var-get btc-price-in-cents)) u100) (* current-loan u100000000)))
         )
           ;; Ensure sufficient collateral remains after withdrawal
           (asserts! (>= new-collateral (var-get minimum-collateral-amount)) ERR-COLLATERAL-BELOW-MINIMUM)
-          (asserts! (is-ok health-response) (unwrap-err health-response))
-          (asserts! (>= (unwrap-ok health-response) (var-get collateralization-ratio)) ERR-LOAN-UNDERCOLLATERALIZED)
+          (asserts! (>= new-health (var-get collateralization-ratio)) ERR-LOAN-UNDERCOLLATERALIZED)
           
           ;; Update collateral amount
           (map-set user-collateral tx-sender new-collateral)
@@ -187,56 +219,44 @@
 )
 
 ;; Function to borrow stablecoin against collateral
-(define-public (borrow (stablecoin <ft-trait>) (amount uint) (oracle <oracle-trait>))
+(define-public (borrow (stablecoin <ft-trait>) (amount uint))
   (begin
     (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
     (asserts! (> amount u0) ERR-ZERO-AMOUNT)
+    (asserts! (not (is-price-stale)) ERR-PRICE-STALE)
     
     (let (
       (collateral (get-user-collateral tx-sender))
       (current-loan (get-user-loan tx-sender))
-      (price-response (contract-call? oracle get-price-in-cents))
-      (last-update-response (contract-call? oracle get-last-update-time))
+      (price-in-cents (var-get btc-price-in-cents))
+      (current-time (unwrap-panic (get-block-info? time (- block-height u1))))
     )
       ;; Verify collateral exists
       (asserts! (>= collateral (var-get minimum-collateral-amount)) ERR-COLLATERAL-BELOW-MINIMUM)
       
-      ;; Verify price data is available and fresh
-      (asserts! (is-ok price-response) (unwrap-err price-response))
-      (asserts! (is-ok last-update-response) (unwrap-err last-update-response))
-      
+      ;; Calculate new total loan
       (let (
-        (price-in-cents (unwrap-ok price-response))
-        (last-update (unwrap-ok last-update-response))
-        (current-time (get-block-info time (- block-height u1)))
+        (new-total-loan (+ current-loan amount))
+        ;; Calculate collateral value in cents: collateral * price-in-cents / 100000000 (sats to BTC conversion)
+        (collateral-value-cents (/ (* collateral price-in-cents) u100000000))
+        ;; Calculate max loan allowed: collateral value / collateralization ratio * 100
+        (max-allowed-loan (/ (* collateral-value-cents u100) (var-get collateralization-ratio)))
       )
-        ;; Check price freshness
-        (asserts! (<= (- current-time last-update) (var-get price-stale-threshold)) ERR-PRICE-STALE)
+        ;; Ensure new loan doesn't exceed max allowed
+        (asserts! (<= new-total-loan max-allowed-loan) ERR-MAX-LOAN-EXCEEDED)
         
-        ;; Calculate new total loan
-        (let (
-          (new-total-loan (+ current-loan amount))
-          ;; Calculate collateral value in cents: collateral * price-in-cents / 100000000 (sats to BTC conversion)
-          (collateral-value-cents (/ (* collateral price-in-cents) u100000000))
-          ;; Calculate max loan allowed: collateral value / collateralization ratio
-          (max-allowed-loan (/ (* collateral-value-cents u100) (var-get collateralization-ratio)))
-        )
-          ;; Ensure new loan doesn't exceed max allowed
-          (asserts! (<= new-total-loan max-allowed-loan) ERR-MAX-LOAN-EXCEEDED)
+        ;; Update loan amount
+        (map-set user-loan-amount tx-sender new-total-loan)
+        (map-set user-last-interest-calc tx-sender current-time)
+        
+        ;; Calculate protocol fee
+        (let ((fee-amount (/ (* amount (var-get protocol-fee)) u100)))
+          ;; Mint stablecoin to user (minus fee)
+          (try! (as-contract (contract-call? stablecoin mint (- amount fee-amount) tx-sender)))
+          ;; Mint fee to governance address
+          (try! (as-contract (contract-call? stablecoin mint fee-amount (var-get governance-address))))
           
-          ;; Update loan amount
-          (map-set user-loan-amount tx-sender new-total-loan)
-          (map-set user-last-interest-calc tx-sender current-time)
-          
-          ;; Calculate protocol fee
-          (let ((fee-amount (/ (* amount (var-get protocol-fee)) u100)))
-            ;; Mint stablecoin to user (minus fee)
-            (try! (as-contract (contract-call? stablecoin mint (- amount fee-amount) tx-sender)))
-            ;; Mint fee to governance address
-            (try! (as-contract (contract-call? stablecoin mint fee-amount (var-get governance-address))))
-            
-            (ok amount)
-          )
+          (ok amount)
         )
       )
     )
@@ -276,17 +296,18 @@
 )
 
 ;; Function to liquidate undercollateralized positions
-(define-public (liquidate (user principal) (sbtc-token <ft-trait>) (stablecoin <ft-trait>) (oracle <oracle-trait>))
+(define-public (liquidate (user principal) (sbtc-token <ft-trait>) (stablecoin <ft-trait>))
   (begin
     (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+    (asserts! (not (is-price-stale)) ERR-PRICE-STALE)
     
     ;; Check if position is liquidatable
-    (asserts! (is-liquidatable user oracle) ERR-LIQUIDATION-FAILED)
+    (asserts! (is-liquidatable user) ERR-LIQUIDATION-FAILED)
     
     (let (
       (loan-amount (get-user-loan user))
       (collateral-amount (get-user-collateral user))
-      (price-response (unwrap! (contract-call? oracle get-price-in-cents) ERR-PRICE-STALE))
+      (price-in-cents (var-get btc-price-in-cents))
       (penalty-amount (/ (* loan-amount (var-get liquidation-penalty)) u100))
       (total-to-repay (+ loan-amount penalty-amount))
     )
