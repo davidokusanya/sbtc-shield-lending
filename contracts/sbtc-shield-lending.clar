@@ -48,3 +48,44 @@
 (define-read-only (get-user-loan (user principal))
   (default-to u0 (map-get? user-loan-amount user))
 )
+
+;; Get loan health percentage (collateral value / loan value * 100)
+(define-read-only (get-loan-health (user principal) (oracle <oracle-trait>))
+  (let (
+    (collateral (get-user-collateral user))
+    (loan (get-user-loan user))
+    (price-response (contract-call? oracle get-price-in-cents))
+    (last-update-response (contract-call? oracle get-last-update-time))
+  )
+    (if (is-err price-response)
+      (err (unwrap-err price-response))
+      (if (is-err last-update-response)
+        (err (unwrap-err last-update-response))
+        (let (
+          (price-in-cents (unwrap! price-response ERR-PRICE-STALE))
+          (last-update (unwrap! last-update-response ERR-PRICE-STALE))
+          (current-time (get-block-info time (- block-height u1)))
+        )
+          (if (> (- current-time last-update) (var-get price-stale-threshold))
+            ERR-PRICE-STALE
+            (if (or (is-eq loan u0) (is-eq collateral u0))
+              (ok u0)
+              ;; Calculate loan health: (collateral * price) / (loan * 100) * 100
+              (ok (/ (* (* collateral price-in-cents) u100) loan))
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Check if loan is eligible for liquidation
+(define-read-only (is-liquidatable (user principal) (oracle <oracle-trait>))
+  (let ((health-response (get-loan-health user oracle)))
+    (if (is-err health-response)
+      true
+      (< (unwrap! health-response ERR-LOAN-NOT-FOUND) (var-get liquidation-threshold))
+    )
+  )
+)
