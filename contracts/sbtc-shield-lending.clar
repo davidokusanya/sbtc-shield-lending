@@ -280,6 +280,7 @@
     (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
     (asserts! (> amount u0) ERR-ZERO-AMOUNT)
     (asserts! (not (is-price-stale)) ERR-PRICE-STALE)
+    (asserts! (is-valid-token stablecoin) ERR-INVALID-TOKEN)
     
     (let (
       (collateral (get-user-collateral tx-sender))
@@ -322,7 +323,8 @@
 ;; Function to repay loan
 (define-public (repay (stablecoin <ft-trait>) (amount uint))
   (begin
-    (asserts! (> amount u0) ERR-ZERO-AMOUNT)
+     (asserts! (> amount u0) ERR-ZERO-AMOUNT)
+    (asserts! (is-valid-token stablecoin) ERR-INVALID-TOKEN)
     
     (let (
       (current-loan (get-user-loan tx-sender))
@@ -356,6 +358,8 @@
   (begin
     (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
     (asserts! (not (is-price-stale)) ERR-PRICE-STALE)
+    (asserts! (is-valid-token sbtc-token) ERR-INVALID-TOKEN)
+    (asserts! (is-valid-token stablecoin) ERR-INVALID-TOKEN)
     
     ;; Check if position is liquidatable
     (asserts! (is-liquidatable user) ERR-LIQUIDATION-FAILED)
