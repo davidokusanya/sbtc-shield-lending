@@ -242,3 +242,35 @@
     )
   )
 )
+
+;; Function to repay loan
+(define-public (repay (stablecoin <ft-trait>) (amount uint))
+  (begin
+    (asserts! (> amount u0) ERR-ZERO-AMOUNT)
+    
+    (let (
+      (current-loan (get-user-loan tx-sender))
+    )
+      ;; Ensure loan exists
+      (asserts! (> current-loan u0) ERR-LOAN-NOT-FOUND)
+      ;; Limit repayment to outstanding loan amount
+      (let ((repay-amount (if (> amount current-loan) current-loan amount)))
+        ;; Transfer stablecoin from user to contract (will be burned)
+        (try! (contract-call? stablecoin transfer repay-amount tx-sender (as-contract tx-sender) none))
+        
+        ;; Update loan amount
+        (map-set user-loan-amount tx-sender (- current-loan repay-amount))
+        ;; If loan fully repaid, clear interest calculation timestamp
+        (if (is-eq (- current-loan repay-amount) u0)
+          (map-delete user-last-interest-calc tx-sender)
+          true
+        )
+        
+        ;; Burn the repaid tokens
+        (try! (as-contract (contract-call? stablecoin burn repay-amount (as-contract tx-sender))))
+        
+        (ok repay-amount)
+      )
+    )
+  )
+)
