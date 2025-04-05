@@ -13,6 +13,8 @@
 (define-constant ERR-ZERO-AMOUNT (err u1007))
 (define-constant ERR-PROTOCOL-PAUSED (err u1008))
 (define-constant ERR-LIQUIDATION-FAILED (err u1009))
+(define-constant ERR-INVALID-TOKEN (err u1010))
+(define-constant ERR-INVALID-PRINCIPAL (err u1011))
 
 ;; Data Variables
 (define-data-var protocol-paused bool false)
@@ -134,17 +136,32 @@
   (or (is-eq tx-sender (var-get governance-address)) (is-eq tx-sender (var-get contract-owner)))
 )
 
+;; Add these validation functions at the beginning of your contract
+(define-private (is-valid-token (token <ft-trait>))
+  (is-some (some (contract-of token)))  ;; Check if the trait reference has a valid contract
+)
+
+(define-private (is-valid-principal (address principal))
+  (and 
+    (not (is-eq address 'SP000000000000000000002Q6VF78))  ;; Check it's not a standard principal
+    (not (is-eq address tx-sender))  ;; Optional: prevent setting to current sender for certain functions
+  )
+)
+
 ;; Protocol governance functions
 (define-public (set-governance-address (new-address principal))
   (begin
     (asserts! (is-governance-or-owner) ERR-NOT-AUTHORIZED)
+    (asserts! (is-valid-principal new-address) ERR-INVALID-PRINCIPAL)
     (ok (var-set governance-address new-address))
   )
 )
 
+
 (define-public (set-contract-owner (new-owner principal))
   (begin
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-valid-principal new-owner) ERR-INVALID-PRINCIPAL)
     (ok (var-set contract-owner new-owner))
   )
 )
@@ -199,6 +216,7 @@
   (begin
     (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
     (asserts! (> amount u0) ERR-ZERO-AMOUNT)
+    (asserts! (is-valid-token sbtc-token) ERR-INVALID-TOKEN)
     
     ;; Transfer sBTC from user to contract
     (let 
@@ -218,6 +236,7 @@
     (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
     (asserts! (> amount u0) ERR-ZERO-AMOUNT)
     (asserts! (not (is-price-stale)) ERR-PRICE-STALE)
+    (asserts! (is-valid-token sbtc-token) ERR-INVALID-TOKEN)
     
     (let (
       (current-collateral (get-user-collateral tx-sender))
@@ -390,6 +409,7 @@
 (define-public (initialize (new-governance principal))
   (begin
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-valid-principal new-governance) ERR-INVALID-PRINCIPAL)
     (var-set governance-address new-governance)
     (ok true)
   )
