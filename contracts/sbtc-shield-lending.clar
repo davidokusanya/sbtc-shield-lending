@@ -125,3 +125,63 @@
     (ok (var-set collateralization-ratio new-ratio))
   )
 )
+
+;; Core lending protocol functions
+
+;; Function to deposit sBTC as collateral
+(define-public (deposit-collateral (sbtc-token <ft-trait>) (amount uint))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+    (asserts! (> amount u0) ERR-ZERO-AMOUNT)
+    
+    ;; Transfer sBTC from user to contract
+    (try! (contract-call? sbtc-token transfer amount tx-sender (as-contract tx-sender) none))
+    
+    ;; Update user's collateral
+    (map-set user-collateral tx-sender (+ (get-user-collateral tx-sender) amount))
+    
+    (ok amount)
+  )
+)
+
+;; Function to withdraw collateral (if no outstanding loans or sufficient collateral remaining)
+(define-public (withdraw-collateral (sbtc-token <ft-trait>) (amount uint) (oracle <oracle-trait>))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+    (asserts! (> amount u0) ERR-ZERO-AMOUNT)
+    
+    (let (
+      (current-collateral (get-user-collateral tx-sender))
+      (current-loan (get-user-loan tx-sender))
+    )
+      ;; Check if user has sufficient collateral
+      (asserts! (>= current-collateral amount) ERR-INSUFFICIENT-COLLATERAL)
+      
+      ;; If there's an outstanding loan, verify collateralization requirements
+      (if (> current-loan u0)
+        (let (
+          (new-collateral (- current-collateral amount))
+          (health-response (get-loan-health tx-sender oracle))
+        )
+          ;; Ensure sufficient collateral remains after withdrawal
+          (asserts! (>= new-collateral (var-get minimum-collateral-amount)) ERR-COLLATERAL-BELOW-MINIMUM)
+          (asserts! (is-ok health-response) (unwrap-err health-response))
+          (asserts! (>= (unwrap-ok health-response) (var-get collateralization-ratio)) ERR-LOAN-UNDERCOLLATERALIZED)
+          
+          ;; Update collateral amount
+          (map-set user-collateral tx-sender new-collateral)
+          
+          ;; Transfer sBTC from contract to user
+          (as-contract (contract-call? sbtc-token transfer amount (as-contract tx-sender) tx-sender none))
+        )
+        (begin
+          ;; If no loan, simply update and transfer
+          (map-set user-collateral tx-sender (- current-collateral amount))
+          (as-contract (contract-call? sbtc-token transfer amount (as-contract tx-sender) tx-sender none))
+        )
+      )
+      
+      (ok amount)
+    )
+  )
+)
